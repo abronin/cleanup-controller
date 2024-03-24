@@ -102,7 +102,7 @@ func NewController(ctx context.Context, kubeclientset kubernetes.Interface, name
 			// oldNs := old.(*corev1.Namespace)
 			if _, ok := newNs.GetAnnotations()["namespace-cleanup-controller/delete-at"]; newNs.Status.Phase == "Terminating" || !ok {
 				// Periodic resync will send update events for all known Namespaces.
-				// Two different versions of the same Namespace will always have different RVs.
+				// We are only interested in Namespaces with namespace-cleanup-controller/delete-at annotation.
 				// Also we are not interested if new version is already in Terminating status.
 				return
 			}
@@ -152,7 +152,7 @@ func (c *Controller) runWorker(ctx context.Context) {
 }
 
 // processNextWorkItem will read a single work item off the workqueue and
-// attempt to process it, by calling the deleteHandler.
+// attempt to process it, by calling the deleteNamespaceHandler.
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	obj, shutdown := c.workqueue.Get()
 	logger := klog.FromContext(ctx)
@@ -188,7 +188,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 
 		// Run the deleteHandler, passing it the namespace/name string of the
 		// Namespace resource to be deleted.
-		if err := c.deleteHandler(ctx, key); err != nil {
+		if err := c.deleteNamespaceHandler(ctx, key); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
 			c.workqueue.AddRateLimited(key)
 			return fmt.Errorf("error deleting '%s': %s, requeuing", key, err.Error())
@@ -208,52 +208,30 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-// deleteHandler deletes the namespace
-// with the current status of the resource.
-func (c *Controller) deleteHandler(ctx context.Context, key string) error {
-	// Convert the namespace/name string into a distinct namespace and name
-	logger := klog.LoggerWithValues(klog.FromContext(ctx), "resourceName", key)
+// deleteNamespaceHandler deletes the namespace with the name passed.
+func (c *Controller) deleteNamespaceHandler(ctx context.Context, name string) error {
+	logger := klog.LoggerWithValues(klog.FromContext(ctx), "namespace", name)
 
-	_, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
-		return nil
-	}
-
-	// Get the Namespace resource with this namespace/name
-	namespace, err := c.namespacesLister.Get(name)
+	// Get the Namespace resource with this name
+	_, err := c.namespacesLister.Get(name)
 	if err != nil {
 		// The Namespace resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("namespace '%s' in work queue no longer exists", key))
+			utilruntime.HandleError(fmt.Errorf("namespace '%s' in work queue no longer exists", name))
 			return nil
 		}
 
 		return err
 	}
 
-	logger.V(4).Info("Delete namespace resource", "namespace", name)
+	logger.V(4).Info("Deleting namespace resource", "namespace", name)
 	err = c.kubeclientset.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
 		return err
 	}
 
-	c.recorder.Event(namespace, corev1.EventTypeNormal, SuccessDeleted, MessageNamespaceDeleted)
 	return nil
-}
-
-// enqueueNamespace takes a Namespace resource and converts it into a namespace/name
-// string which is then put onto the work queue. This method should *not* be
-// passed resources of any type other than Namespace.
-func (c *Controller) enqueueNamespace(obj interface{}) {
-	var key string
-	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
-		utilruntime.HandleError(err)
-		return
-	}
-	c.workqueue.Add(key)
 }
 
 // handleObject will take any resource implementing metav1.Object and check
@@ -288,7 +266,7 @@ func (c *Controller) handleObject(obj interface{}) {
 		}
 		if deleteAt.Before(time.Now()) {
 			logger.Info("Sending namespace for deletion", "namespace", object.GetName())
-			c.enqueueNamespace(object)
+			c.workqueue.Add(object.GetName())
 		} else {
 			logger.V(4).Info("Skipping namespace because it is too early to delete", "namespace", object.GetName(), "delete-at", val)
 		}
